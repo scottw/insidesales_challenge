@@ -25,8 +25,8 @@ sub get_opts {
 # Applies the defaults (and validations, and transforms) of $d to complete $o
 sub resolve_opts {
 	my ($d, $o) = (longhand(shift), shift);
-	my @keys = sort { oprank($d, $a) <=> oprank($d, $b) } keys(%$d);
 
+	my @keys = sort { oprank($d, $a) <=> oprank($d, $b) || $a cmp $b } keys(%$d);
 	# write all final values into $o
 	map { $o->{$_} = val($o, $d, $_) } @keys; 
 	# run all transforms
