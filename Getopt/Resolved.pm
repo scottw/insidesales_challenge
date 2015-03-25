@@ -74,7 +74,7 @@ sub read_opts {
 # get/resolve a single option value
 sub val {
 	my ($o, $d, $key) = @_;
-	return $o->{$key} if $o->{$key};
+	return $o->{$key} if defined $o->{$key};
 	helpdie($d, "Missing required option: $key") unless exists $d->{$key}->{d};
 	'CODE' eq ref($d->{$key}->{d})
 		? $d->{$key}->{d}->(resolve_func($o, $d)) # force scalar context if only one argument
