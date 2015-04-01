@@ -1,0 +1,206 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use feature 'say';
+
+use Amazon::S3;    ## Amazon's sample Perl was ugly
+use Getopt::NounVerb ':all';
+
+monkey_patch();    ## apply monkey patches
+
+my $conf = do { local $/; eval <DATA> }    ## ...or shove this in a .conf file
+  or die "Unable to parse configuration file: $@\n";
+
+my $sub = {
+    map {
+        $a = $_;
+        $a => {
+            map { $_ => delete $conf->{$a}->{$_}->{_sub} }
+              grep { ref $conf->{$a}->{$_}->{_sub} eq 'CODE' }
+              grep { ref $conf->{$a}->{$_} eq 'HASH' }
+              keys %{ $conf->{$a} }
+          }
+    } keys %$conf
+};
+
+my ($noun, $verb, $opts) = get_nv_opts($conf);
+
+$opts->{s3} =
+  Amazon::S3->new({ aws_access_key_id => delete $opts->{access}, aws_secret_access_key => delete $opts->{secret}, });
+
+($sub->{$noun}->{$verb} || opfunc($noun, $verb))->($opts);
+
+exit;
+
+sub monkey_patch {
+
+    package Amazon::S3 {
+        no warnings 'redefine';
+
+        ## fix error handling bug; see my patch in RT:
+        ## https://rt.cpan.org/Ticket/Display.html?id=103148
+        sub _remember_errors {
+            my ($self, $src) = @_;
+
+            unless (ref $src || $src =~ m/^[[:space:]]*</) {    # if not xml
+                (my $code = $src) =~ s/^[[:space:]]*\([0-9]*\).*$/$1/;
+                $self->err($code);
+                $self->errstr($src);
+                return 1;
+            }
+
+            my $r = ref $src ? $src : $self->_xpc_of_content($src);
+
+            if ($r->{Code}) {
+                $self->err($r->{Code});
+                $self->errstr($r->{Message});
+                return 1;
+            }
+            return 0;
+        }
+
+        ## bypass outdated acl checks
+        sub _validate_acl_short { }
+    }
+
+}
+
+## poor man's file-extension-to-mime-type lookup; could also use
+## LWP::MediaTypes since Amazon::S3 depends on it
+sub mime {
+    +{
+        gz   => 'application/gzip',
+        js   => 'application/javascript',
+        json => 'application/json',
+        pdf  => 'application/pdf',
+        zip  => 'application/zip',
+
+        flac => 'audio/flac',
+        m4a  => 'audio/mp4',
+        mp3  => 'audio/mpeg',
+        mpeg => 'audio/mpeg',
+        ogg  => 'audio/ogg',
+
+        gif  => 'image/gif',
+        jpeg => 'image/jpeg',
+        jpg  => 'image/jpeg',
+        png  => 'image/png',
+        svg  => 'image/svg+xml',
+        tif  => 'image/tiff',
+        tiff => 'image/tiff',
+
+        css  => 'text/css',
+        csv  => 'text/csv',
+        html => 'text/html',
+        txt  => 'text/plain',
+        rtf  => 'text/rtf',
+        xml  => 'text/xml',
+
+        avi => 'video/avi',
+        mp4 => 'video/mp4',
+        mov => 'video/quicktime',
+    }->{ lc(shift // '') } // 'application/octet-stream';
+}
+
+__DATA__
+my %shared_opts =
+  (access => { h => 'aws access key' }, secret => { h => 'aws secret key' });
+
+## config
+{
+    bucket => {
+        h    => 'S3 bucket operations',
+        list => {
+            h => 'list buckets',
+            %shared_opts,
+            _sub => sub {
+                my $args = shift;
+                my $resp = $args->{s3}->buckets
+                  or die "Unable to list buckets: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                say $_->bucket . "\t" . $_->creation_date for @{ $resp->{buckets} };
+            }
+        },
+        create => {
+            h      => 'create a new bucket',
+            bucket => { h => 'name of the new bucket', },
+            %shared_opts,
+            _sub => sub {
+                my $args = shift;
+                my $resp = $args->{s3}->add_bucket({ bucket => $args->{bucket} })
+                  or die "Unable to create bucket: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+
+                say "bucket created";
+            }
+        },
+        delete => {
+            h      => 'delete an empty bucket',
+            bucket => 'name of the bucket to delete',
+            %shared_opts,
+            _sub => sub {
+                my $args = shift;
+                my $resp = $args->{s3}->delete_bucket({ bucket => $args->{bucket} })
+                  or die "Unable to delete bucket: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+
+                say "bucket deleted";
+            }
+        },
+    },
+    file => {
+        h    => 'S3 file operations',
+        list => {
+            h => 'list files in a bucket',
+            %shared_opts,
+            bucket => { h => 'name of the bucket' },
+            _sub   => sub {
+                my $args = shift;
+                my $resp = $args->{s3}->list_bucket({ bucket => $args->{bucket} })
+                  or die "Unable to list bucket: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+
+                ## FIXME: for more detail (e.g., content-type), we could head the key
+                say $_->{owner_displayname} . "\t" . $_->{size} . "\t" . $_->{last_modified} . "\t" . $_->{key}
+                  for @{ $resp->{keys} };
+            }
+        },
+        upload => {
+            h => 'upload a file into an S3 bucket',
+            %shared_opts,
+            bucket => { h => 'name of the bucket' },
+            file   => { h => 'filename to upload' },
+            _sub   => sub {
+                my $args   = shift;
+                my $bucket = $args->{s3}->bucket($args->{bucket});
+
+                ## NOTE: would be better to stream large objects...
+                my $content;
+                open my $fh, "<", $args->{file} or die "Unable to open '$args->{file}': $!\n";
+                {
+                    local $/;
+                    $content = <$fh>;
+                }
+                close $fh;
+
+                my ($ext) = $args->{file} =~ /\.([^.]+)$/;
+
+                my $resp = $bucket->add_key($args->{file}, $content, { content_type => mime($ext), acl_short => 'bucket-owner-full-control' })
+                  or die "Unable to add file: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+
+                say "file uploaded";
+            },
+        },
+        delete => {
+            h => 'delete a file from an S3 bucket',
+            %shared_opts,
+            bucket => { h => 'name of the bucket' },
+            file   => { h => 'filename to delete' },
+            _sub   => sub {
+                my $args   = shift;
+                my $bucket = $args->{s3}->bucket($args->{bucket});
+
+                my $resp = $bucket->delete_key($args->{file})
+                  or die "Unable to delete file: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+
+                say "file deleted";
+            }
+        }
+    },
+};
