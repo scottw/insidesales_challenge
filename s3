@@ -11,6 +11,7 @@ monkey_patch();    ## apply monkey patches
 my $conf = do { local $/; eval <DATA> }    ## ...or shove this in a .conf file
   or die "Unable to parse configuration file: $@\n";
 
+## pull the subs out of the config data
 my $sub = {
     map {
         $a = $_;
@@ -25,8 +26,13 @@ my $sub = {
 
 my ($noun, $verb, $opts) = get_nv_opts($conf);
 
-$opts->{s3} =
-  Amazon::S3->new({ aws_access_key_id => delete $opts->{access}, aws_secret_access_key => delete $opts->{secret}, });
+$opts->{s3} = Amazon::S3->new(
+    {
+        aws_access_key_id     => delete $opts->{access},
+        aws_secret_access_key => delete $opts->{secret},
+        ($opts->{location} ? (host => 's3-' . $opts->{location} . '.amazonaws.com') : ())
+    }
+);
 
 ($sub->{$noun}->{$verb} || opfunc($noun, $verb))->($opts);
 
@@ -104,7 +110,10 @@ sub mime {
 
 __DATA__
 my %shared_opts =
-  (access => { h => 'aws access key' }, secret => { h => 'aws secret key' });
+  (access => { h => 'aws access key' }, secret => { h => 'aws secret key' }, location => { h => 'aws location', d => '' });
+
+my $die = sub { my ($msg, $args) = @_;
+                die $msg . ($args->{s3}->err ? ": " . $args->{s3}->err . " (" . $args->{s3}->errstr . ")" : ": not found") . "\n"; };
 
 ## config
 {
@@ -116,7 +125,8 @@ my %shared_opts =
             _sub => sub {
                 my $args = shift;
                 my $resp = $args->{s3}->buckets
-                  or die "Unable to list buckets: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                  or $die->("Unable to list buckets", $args);
+
                 say $_->bucket . "\t" . $_->creation_date for @{ $resp->{buckets} };
             }
         },
@@ -127,7 +137,7 @@ my %shared_opts =
             _sub => sub {
                 my $args = shift;
                 my $resp = $args->{s3}->add_bucket({ bucket => $args->{bucket} })
-                  or die "Unable to create bucket: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                  or $die->("Unable to create bucket", $args);
 
                 say "bucket created";
             }
@@ -139,7 +149,7 @@ my %shared_opts =
             _sub => sub {
                 my $args = shift;
                 my $resp = $args->{s3}->delete_bucket({ bucket => $args->{bucket} })
-                  or die "Unable to delete bucket: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                  or $die->("Unable to delete bucket", $args);
 
                 say "bucket deleted";
             }
@@ -154,11 +164,40 @@ my %shared_opts =
             _sub   => sub {
                 my $args = shift;
                 my $resp = $args->{s3}->list_bucket({ bucket => $args->{bucket} })
-                  or die "Unable to list bucket: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                  or $die->("Unable to list bucket", $args);
 
-                ## FIXME: for more detail (e.g., content-type), we could head the key
-                say $_->{owner_displayname} . "\t" . $_->{size} . "\t" . $_->{last_modified} . "\t" . $_->{key}
+                say +($_->{owner_displayname} // '') . "\t" . $_->{size} . "\t" . $_->{last_modified} . "\t" . $_->{key}
                   for @{ $resp->{keys} };
+            }
+        },
+        head => {
+            h => 'head a file in an S3 bucket',
+            %shared_opts,
+            bucket => { h => 'name of the bucket' },
+            file   => { h => 'filename to head' },
+            _sub   => sub {
+                my $args   = shift;
+                my $bucket = $args->{s3}->bucket($args->{bucket});
+
+                my $resp = $bucket->head_key($args->{file})
+                  or $die->("Unable to head file", $args);
+
+                say $resp->{content_length} . "\t" . $resp->{content_type};
+            }
+        },
+        get => {
+            h => 'get a file in an S3 bucket',
+            %shared_opts,
+            bucket => { h => 'name of the bucket' },
+            file   => { h => 'filename to get' },
+            _sub   => sub {
+                my $args   = shift;
+                my $bucket = $args->{s3}->bucket($args->{bucket});
+
+                my $resp = $bucket->get_key($args->{file})
+                  or $die->("Unable to get file", $args);
+
+                print $resp->{value};
             }
         },
         upload => {
@@ -182,7 +221,7 @@ my %shared_opts =
                 my ($ext) = $args->{file} =~ /\.([^.]+)$/;
 
                 my $resp = $bucket->add_key($args->{file}, $content, { content_type => mime($ext), acl_short => 'bucket-owner-full-control' })
-                  or die "Unable to add file: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                  or $die->("Unable to add file", $args);
 
                 say "file uploaded";
             },
@@ -197,7 +236,7 @@ my %shared_opts =
                 my $bucket = $args->{s3}->bucket($args->{bucket});
 
                 my $resp = $bucket->delete_key($args->{file})
-                  or die "Unable to delete file: " . $args->{s3}->err . ": " . $args->{s3}->errstr . "\n";
+                  or $die->("Unable to delete file", $args);
 
                 say "file deleted";
             }
